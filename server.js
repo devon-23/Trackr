@@ -9,7 +9,7 @@ const API_KEY = process.env.SETLIST_API_KEY;
 
 // In-memory cache
 const cache = new Map();
-const CACHE_TTL = 1000 * 60 * 60; // 1 hour
+const CACHE_TTL = 1000 * 60 * 60 * 6; // 6 hours
 
 function getCache(key) {
   const item = cache.get(key);
@@ -32,7 +32,6 @@ async function apiRequest(endpoint, retries = 3) {
   const cacheKey = endpoint;
   const cached = getCache(cacheKey);
   if (cached) {
-    console.log(`[CACHE] ${endpoint}`);
     return cached;
   }
 
@@ -49,7 +48,7 @@ async function apiRequest(endpoint, retries = 3) {
         'Accept': 'application/json',
         'x-api-key': API_KEY
       },
-      timeout: 15000 // 15 second timeout
+      timeout: 15000
     });
 
     setCache(cacheKey, res.data);
@@ -74,7 +73,6 @@ app.get('/api/search-artist', async (req, res) => {
 
     const data = await apiRequest(`/search/artists?artistName=${encodeURIComponent(name)}&p=1&sort=relevance`);
 
-    // FIX: Handle both possible response structures
     const artists = data.artist || data.artists?.artist || [];
     if (!artists.length) return res.status(404).json({ error: 'Artist not found' });
 
@@ -86,53 +84,100 @@ app.get('/api/search-artist', async (req, res) => {
   }
 });
 
-// Get all unique tours for an artist
-app.get('/api/tours', async (req, res) => {
+// SSE stream for fetching ALL tours (no page cap)
+app.get('/api/tours-stream', async (req, res) => {
+  const { mbid } = req.query;
+  if (!mbid) {
+    res.status(400).json({ error: 'MBID required' });
+    return;
+  }
+
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
-    const { mbid } = req.query;
-    if (!mbid) return res.status(400).json({ error: 'MBID required' });
+    // First, get page 1 to find total pages
+    const firstPage = await apiRequest(`/artist/${mbid}/setlists?p=1`);
+    const setlistsFirst = firstPage.setlist || firstPage.setlists?.setlist || [];
+    const total = parseInt(firstPage.total) || setlistsFirst.length;
+    const perPage = parseInt(firstPage.itemsPerPage) || 20;
+    const totalPages = total > 0 ? Math.ceil(total / perPage) : 1;
 
-    const allSetlists = [];
-    let page = 1;
-    let totalPages = 1;
-    const MAX_PAGES = 25; // Reduced from 50 — recent tours are in recent setlists
+    const allSetlists = [...setlistsFirst];
+    const tours = new Set();
 
-    do {
-      console.log(`[TOURS] Fetching page ${page} for ${mbid}...`);
-      const data = await apiRequest(`/artist/${mbid}/setlists?p=${page}`);
+    // Collect tours from page 1
+    setlistsFirst.forEach(s => {
+      if (s.tour?.name) tours.add(s.tour.name);
+    });
 
-      // FIX: Handle multiple possible response structures
-      const setlists = data.setlist || data.setlists?.setlist || [];
-      if (Array.isArray(setlists) && setlists.length > 0) {
+    send({
+      type: 'progress',
+      page: 1,
+      totalPages,
+      setlistsFound: allSetlists.length,
+      toursFound: tours.size,
+      tours: [...tours].sort()
+    });
+
+    // Fetch remaining pages — NO MAX_PAGES CAP
+    for (let page = 2; page <= totalPages; page++) {
+      try {
+        const data = await apiRequest(`/artist/${mbid}/setlists?p=${page}`);
+        const setlists = data.setlist || data.setlists?.setlist || [];
+
+        if (setlists.length === 0) break; // No more data
+
         allSetlists.push(...setlists);
+
+        setlists.forEach(s => {
+          if (s.tour?.name) tours.add(s.tour.name);
+        });
+
+        send({
+          type: 'progress',
+          page,
+          totalPages,
+          setlistsFound: allSetlists.length,
+          toursFound: tours.size,
+          tours: [...tours].sort()
+        });
+
+      } catch (err) {
+        console.error(`[SSE] Error on page ${page}:`, err.message);
+        send({
+          type: 'error',
+          page,
+          message: err.message
+        });
+        // Continue to next page instead of crashing
+        await sleep(2000);
       }
+    }
 
-      // FIX: Safer pagination calculation
-      const total = parseInt(data.total) || 0;
-      const perPage = parseInt(data.itemsPerPage) || 20;
-      totalPages = total > 0 ? Math.ceil(total / perPage) : 1;
+    send({
+      type: 'complete',
+      totalSetlists: allSetlists.length,
+      tours: [...tours].sort(),
+      totalPages
+    });
 
-      console.log(`[TOURS] Page ${page}: got ${setlists.length} setlists, total=${total}, perPage=${perPage}, totalPages=${totalPages}`);
-
-      page++;
-    } while (page <= totalPages && page <= MAX_PAGES);
-
-    console.log(`[TOURS] Total setlists collected: ${allSetlists.length}`);
-
-    const tours = [...new Set(allSetlists
-      .filter(s => s.tour?.name)
-      .map(s => s.tour.name))].sort();
-
-    console.log(`[TOURS] Found ${tours.length} unique tours:`, tours.slice(0, 10));
-
-    res.json({ tours, totalSetlists: allSetlists.length });
   } catch (err) {
-    console.error('Tours error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('[SSE] Fatal error:', err.message);
+    send({ type: 'error', message: err.message });
+  } finally {
+    res.end();
   }
 });
 
-// Get shows for a specific tour
+// Get shows for a specific tour (also no cap now)
 app.get('/api/tour-shows', async (req, res) => {
   try {
     const { mbid, tour } = req.query;
@@ -141,10 +186,8 @@ app.get('/api/tour-shows', async (req, res) => {
     const allSetlists = [];
     let page = 1;
     let totalPages = 1;
-    const MAX_PAGES = 30;
 
     do {
-      console.log(`[SHOWS] Fetching page ${page} for tour "${tour}"...`);
       const data = await apiRequest(`/artist/${mbid}/setlists?p=${page}`);
 
       const setlists = data.setlist || data.setlists?.setlist || [];
@@ -157,7 +200,7 @@ app.get('/api/tour-shows', async (req, res) => {
       totalPages = total > 0 ? Math.ceil(total / perPage) : 1;
 
       page++;
-    } while (page <= totalPages && page <= MAX_PAGES);
+    } while (page <= totalPages);
 
     const filtered = allSetlists.filter(s => {
       if (!s.tour?.name) return false;

@@ -28,7 +28,7 @@ function setCache(key, data) {
 let lastRequest = 0;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function apiRequest(endpoint) {
+async function apiRequest(endpoint, retries = 3) {
   const cacheKey = endpoint;
   const cached = getCache(cacheKey);
   if (cached) {
@@ -42,15 +42,26 @@ async function apiRequest(endpoint) {
   lastRequest = Date.now();
 
   const url = `https://api.setlist.fm/rest/1.0${endpoint}`;
-  const res = await axios.get(url, {
-    headers: {
-      'Accept': 'application/json',
-      'x-api-key': API_KEY
-    }
-  });
 
-  setCache(cacheKey, res.data);
-  return res.data;
+  try {
+    const res = await axios.get(url, {
+      headers: {
+        'Accept': 'application/json',
+        'x-api-key': API_KEY
+      },
+      timeout: 15000 // 15 second timeout
+    });
+
+    setCache(cacheKey, res.data);
+    return res.data;
+  } catch (err) {
+    if (retries > 0 && (err.response?.status === 429 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT')) {
+      console.log(`[RETRY] ${endpoint} — ${err.message}, retries left: ${retries}`);
+      await sleep(2000);
+      return apiRequest(endpoint, retries - 1);
+    }
+    throw err;
+  }
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -60,13 +71,17 @@ app.get('/api/search-artist', async (req, res) => {
   try {
     const { name } = req.query;
     if (!name) return res.status(400).json({ error: 'Name required' });
-    
+
     const data = await apiRequest(`/search/artists?artistName=${encodeURIComponent(name)}&p=1&sort=relevance`);
-    if (!data.artist?.length) return res.status(404).json({ error: 'Artist not found' });
-    
-    const artist = data.artist[0];
+
+    // FIX: Handle both possible response structures
+    const artists = data.artist || data.artists?.artist || [];
+    if (!artists.length) return res.status(404).json({ error: 'Artist not found' });
+
+    const artist = artists[0];
     res.json({ mbid: artist.mbid, name: artist.name });
   } catch (err) {
+    console.error('Search artist error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -76,24 +91,43 @@ app.get('/api/tours', async (req, res) => {
   try {
     const { mbid } = req.query;
     if (!mbid) return res.status(400).json({ error: 'MBID required' });
-    
+
     const allSetlists = [];
     let page = 1;
     let totalPages = 1;
+    const MAX_PAGES = 25; // Reduced from 50 — recent tours are in recent setlists
 
     do {
+      console.log(`[TOURS] Fetching page ${page} for ${mbid}...`);
       const data = await apiRequest(`/artist/${mbid}/setlists?p=${page}`);
-      if (data.setlist) allSetlists.push(...data.setlist);
-      totalPages = Math.ceil(data.total / data.itemsPerPage);
+
+      // FIX: Handle multiple possible response structures
+      const setlists = data.setlist || data.setlists?.setlist || [];
+      if (Array.isArray(setlists) && setlists.length > 0) {
+        allSetlists.push(...setlists);
+      }
+
+      // FIX: Safer pagination calculation
+      const total = parseInt(data.total) || 0;
+      const perPage = parseInt(data.itemsPerPage) || 20;
+      totalPages = total > 0 ? Math.ceil(total / perPage) : 1;
+
+      console.log(`[TOURS] Page ${page}: got ${setlists.length} setlists, total=${total}, perPage=${perPage}, totalPages=${totalPages}`);
+
       page++;
-    } while (page <= totalPages && page <= 50);
+    } while (page <= totalPages && page <= MAX_PAGES);
+
+    console.log(`[TOURS] Total setlists collected: ${allSetlists.length}`);
 
     const tours = [...new Set(allSetlists
       .filter(s => s.tour?.name)
       .map(s => s.tour.name))].sort();
 
+    console.log(`[TOURS] Found ${tours.length} unique tours:`, tours.slice(0, 10));
+
     res.json({ tours, totalSetlists: allSetlists.length });
   } catch (err) {
+    console.error('Tours error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -103,17 +137,27 @@ app.get('/api/tour-shows', async (req, res) => {
   try {
     const { mbid, tour } = req.query;
     if (!mbid || !tour) return res.status(400).json({ error: 'MBID and tour required' });
-    
+
     const allSetlists = [];
     let page = 1;
     let totalPages = 1;
+    const MAX_PAGES = 30;
 
     do {
+      console.log(`[SHOWS] Fetching page ${page} for tour "${tour}"...`);
       const data = await apiRequest(`/artist/${mbid}/setlists?p=${page}`);
-      if (data.setlist) allSetlists.push(...data.setlist);
-      totalPages = Math.ceil(data.total / data.itemsPerPage);
+
+      const setlists = data.setlist || data.setlists?.setlist || [];
+      if (Array.isArray(setlists) && setlists.length > 0) {
+        allSetlists.push(...setlists);
+      }
+
+      const total = parseInt(data.total) || 0;
+      const perPage = parseInt(data.itemsPerPage) || 20;
+      totalPages = total > 0 ? Math.ceil(total / perPage) : 1;
+
       page++;
-    } while (page <= totalPages && page <= 50);
+    } while (page <= totalPages && page <= MAX_PAGES);
 
     const filtered = allSetlists.filter(s => {
       if (!s.tour?.name) return false;
@@ -132,6 +176,7 @@ app.get('/api/tour-shows', async (req, res) => {
         date: s.eventDate,
         venue: s.venue?.name || 'Unknown Venue',
         city: s.venue?.city?.name || 'Unknown City',
+        state: s.venue?.city?.state || s.venue?.city?.stateCode || '',
         country: s.venue?.city?.country?.name || 'Unknown Country',
         coords: s.venue?.city?.coords || null,
         setlistUrl: s.url
@@ -139,6 +184,7 @@ app.get('/api/tour-shows', async (req, res) => {
 
     res.json({ tour, totalShows: shows.length, shows });
   } catch (err) {
+    console.error('Tour shows error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
